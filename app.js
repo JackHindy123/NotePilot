@@ -23,6 +23,30 @@
   const save = () => { store.set("notes", notes); store.set("sets", sets); store.set("selected", [...selected]); };
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
+  /* ---------- AI (Google Gemini via your Cloudflare Worker; see config.js) ---------- */
+  const AI = String((window.NOTEPILOT_CONFIG || {}).aiEndpoint || "").trim().replace(/\/+$/, "");
+  async function aiPost(path, body) {
+    let res;
+    try {
+      res = await fetch(AI + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    } catch { throw new Error("Couldn't reach the AI service. Check your connection."); }
+    let data = {};
+    try { data = await res.json(); } catch {}
+    if (!res.ok) throw new Error(data.error || "The AI couldn't finish that request.");
+    return data;
+  }
+  // Canvas -> base64 JPEG sized for AI vision (long side ~1568px keeps uploads small)
+  function canvasToB64(canvas) {
+    const scale = Math.min(1, 1568 / Math.max(canvas.width, canvas.height));
+    let c = canvas;
+    if (scale < 1) {
+      c = document.createElement("canvas");
+      c.width = Math.round(canvas.width * scale); c.height = Math.round(canvas.height * scale);
+      const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height); g.drawImage(canvas, 0, 0, c.width, c.height);
+    }
+    return c.toDataURL("image/jpeg", 0.85).split(",")[1];
+  }
+
   function toast(msg) {
     const t = $("#toast");
     t.textContent = msg;
@@ -30,9 +54,21 @@
     clearTimeout(toast._t);
     toast._t = setTimeout(() => t.classList.add("hidden"), 2600);
   }
-  function modal(title, body) {
+  // Persistent progress message while files are being read
+  function status(msg) {
+    const t = $("#toast");
+    clearTimeout(toast._t);
+    if (msg) { t.textContent = msg; t.classList.remove("hidden"); }
+    else t.classList.add("hidden");
+  }
+  function modal(title, body, onSave) {
     $("#modal-title").textContent = title;
-    $("#modal-body").textContent = body;
+    const mb = $("#modal-body");
+    if (onSave) {
+      mb.innerHTML = '<textarea class="input" id="modal-edit" style="min-height:320px;width:100%"></textarea><div class="row" style="margin-top:12px"><button class="btn btn-primary" id="modal-save">Save changes</button><span class="muted small">Fix any words the reader got wrong.</span></div>';
+      $("#modal-edit").value = body;
+      $("#modal-save").onclick = () => { onSave($("#modal-edit").value); $("#modal").classList.add("hidden"); };
+    } else mb.textContent = body;
     $("#modal").classList.remove("hidden");
   }
   $("#modal").addEventListener("click", (e) => { if (e.target.id === "modal" || e.target.closest("[data-close]")) $("#modal").classList.add("hidden"); });
@@ -48,9 +84,61 @@
   }
 
   /* ---------- file reading ---------- */
+  /* ---------- OCR (photos, scans, handwriting) via Tesseract.js, loaded only when needed ---------- */
+  const IMAGE_EXT = ["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+  let ocrWorker = null;
+  function loadScript(src) {
+    return new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = src; s.onload = res; s.onerror = () => rej(new Error("The text-recognition reader didn't load. Check your connection."));
+      document.head.appendChild(s);
+    });
+  }
+  async function getOcr() {
+    if (ocrWorker) return ocrWorker;
+    if (!window.Tesseract) await loadScript("https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js");
+    status("Loading text recognition (first time only)…");
+    ocrWorker = await Tesseract.createWorker("eng");
+    return ocrWorker;
+  }
+  let aiReadWarned = false;
+  async function readImage(canvas, label) {
+    if (AI) {
+      try {
+        status(`AI is reading ${label}…`);
+        const { text } = await aiPost("/read", { image: canvasToB64(canvas), mediaType: "image/jpeg" });
+        if (text && text.trim()) return text.trim();
+      } catch (err) {
+        if (!aiReadWarned) { aiReadWarned = true; toast(err.message + " Using the built-in reader instead."); await new Promise((r) => setTimeout(r, 1800)); }
+      }
+    }
+    return ocrImage(canvas, label);
+  }
+  async function ocrImage(source, label) {
+    const w = await getOcr();
+    status(`Reading ${label}…`);
+    const { data } = await w.recognize(source);
+    return data.text.split("\n").map((l) => l.trim()).filter((l) => l.length > 1).join("\n");
+  }
+  // Downscale large photos (phone pictures are huge) so OCR is faster
+  async function prepImage(file) {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+    return c;
+  }
+
   async function readFile(file) {
     const ext = file.name.split(".").pop().toLowerCase();
     if (["txt", "md", "markdown", "text", "csv"].includes(ext)) return file.text();
+    if (IMAGE_EXT.includes(ext)) {
+      let img;
+      try { img = await prepImage(file); } catch { throw new Error(`Couldn't open ${file.name} as an image.`); }
+      return readImage(img, file.name);
+    }
+    if (["heic", "heif"].includes(ext)) throw new Error("iPhone HEIC photos aren't supported by browsers. Change your camera to \"Most Compatible\" or export the photo as JPG.");
     const buf = await file.arrayBuffer();
     if (ext === "pdf") {
       if (!window.pdfjsLib) throw new Error("PDF reader didn't load. Check your connection.");
@@ -58,7 +146,18 @@
       const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
       const pages = [];
       for (let i = 1; i <= pdf.numPages; i++) {
-        const tc = await (await pdf.getPage(i)).getTextContent();
+        const page = await pdf.getPage(i);
+        const tc = await page.getTextContent();
+        const raw = tc.items.map((it) => it.str).join("").replace(/\s/g, "");
+        if (raw.length < 25) {
+          // Little or no real text on this page: it's a scan or photo, so render it and OCR it
+          const vp = page.getViewport({ scale: 2 });
+          const c = document.createElement("canvas");
+          c.width = vp.width; c.height = vp.height;
+          await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+          pages.push(await readImage(c, `page ${i} of ${pdf.numPages} in ${file.name}`));
+          continue;
+        }
         let line = "", lines = [], lastY = null;
         tc.items.forEach((it) => {
           const y = it.transform[5];
@@ -90,7 +189,7 @@
       }
       return out.join("\n\n");
     }
-    throw new Error(`.${ext} files aren't supported. Use PDF, PowerPoint, Word, Markdown, or plain text.`);
+    throw new Error(`.${ext} files aren't supported. Use PDF, PowerPoint, Word, Markdown, plain text, or a photo (JPG/PNG).`);
   }
   const decodeXml = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
 
@@ -101,11 +200,13 @@
     for (const f of files) {
       if (f.size > MAX_FILE) { toast(`${f.name} is over 15 MB.`); continue; }
       try {
+        status(`Reading ${f.name}…`);
         const text = await readFile(f);
         if (addNote(f.name.replace(/\.[^.]+$/, ""), text, f.name)) added++;
-      } catch (err) { toast(err.message || `Couldn't read ${f.name}.`); }
+      } catch (err) { status(null); toast(err.message || `Couldn't read ${f.name}.`); }
     }
-    if (added) { toast(`Added ${added} note${added > 1 ? "s" : ""}.`); render(); }
+    status(null);
+    if (added) { toast(`Added ${added} note${added > 1 ? "s" : ""}. Preview to check the text.`); render(); }
   }
 
   /* ---------- shared bits ---------- */
@@ -133,7 +234,8 @@
       const go = $("#go-format"); if (go) go.disabled = !selected.size;
     }));
     $$("[data-preview]", root).forEach((b) => b.addEventListener("click", () => {
-      const n = notes.find((x) => x.id === b.dataset.preview); if (n) modal(n.title, n.text);
+      const n = notes.find((x) => x.id === b.dataset.preview);
+      if (n) modal(n.title, n.text, (text) => { if (text.trim()) { n.text = text.trim(); save(); toast("Notes updated."); render(); } });
     }));
     $$("[data-remove-note]", root).forEach((b) => b.addEventListener("click", () => {
       notes = notes.filter((x) => x.id !== b.dataset.removeNote); selected.delete(b.dataset.removeNote); save(); render();
@@ -152,10 +254,11 @@
           <div class="dropzone" id="drop">
             <div class="drop-icon">↑</div>
             <h3>Drag and drop your notes here</h3>
-            <p class="muted small" style="margin:0 0 14px">PDF, PowerPoint, Word, Markdown, or plain text</p>
+            <p class="muted small" style="margin:0 0 14px">PDF, PowerPoint, Word, Markdown, plain text, or photos of notes</p>
             <button class="btn btn-primary" id="browse">Browse files</button>
-            <input type="file" id="file" multiple accept=".pdf,.pptx,.docx,.md,.markdown,.txt" hidden />
-            <p class="muted small" style="margin:14px 0 0">15 MB per file · 12 files per upload · Text-based documents only</p>
+            <input type="file" id="file" multiple accept=".pdf,.pptx,.docx,.md,.markdown,.txt,.jpg,.jpeg,.png,.webp,.gif,.bmp,image/*" hidden />
+            <p class="muted small" style="margin:14px 0 0">15 MB per file · 12 files per upload</p>
+            <p class="muted small" style="margin:6px 0 0">Scans and handwriting are read with text recognition. Neat handwriting works best, so preview the text after uploading.</p>
           </div>
           <div class="divider">or start with text</div>
           <label class="lbl" for="ntitle">Notes title</label>
@@ -176,8 +279,9 @@
             <div class="flow-item"><span class="num">03</span><div><h4>Make it work for you</h4><p>Open source excerpts, flip and mark cards, and edit confusing explanations.</p></div></div>
           </div>
           <div class="card soft small">
-            <b>Private by design</b>
-            <p style="margin:6px 0 0">Your notes are processed right here in your browser with rule-based generation. Nothing is uploaded to a server.</p>
+            ${AI ? `<b>AI-powered by Google Gemini</b>
+            <p style="margin:6px 0 0">Photos, scans, and handwriting are read by AI, and AI mode writes your study sets. Those files and notes are sent to Google's Gemini (free tier), and Google may use them to improve its products, so don't upload anything private. Saved notes and study sets stay in this browser. Choose rule-based mode to keep everything offline.</p>` : `<b>Private by design</b>
+            <p style="margin:6px 0 0">Your notes are processed right here in your browser with rule-based generation. Nothing is uploaded to a server.</p>`}
           </div>
         </aside>
       </div>
@@ -210,6 +314,7 @@
 
   function viewCreate() {
     let format = store.get("lastFormat", "flashcards");
+    let mode = AI ? store.get("lastMode", "ai") : "rules";
     app.innerHTML = `
       <a class="backlink" href="#/">← Back to notes</a>
       <p class="eyebrow">Step 2 — Make it yours</p>
@@ -233,7 +338,7 @@
             ${opt("exam", "Practice exam", "Short-answer questions with revealable model answers.", "✓")}
           </div>
           <label class="lbl" for="mode">Generation mode</label>
-          <select class="input" id="mode"><option>Rule-based (no AI)</option></select>
+          <select class="input" id="mode">${AI ? `<option value="ai" ${mode === "ai" ? "selected" : ""}>AI (Gemini): best quality</option>` : ""}<option value="rules" ${mode === "rules" ? "selected" : ""}>Rule-based (no AI): instant and private</option></select>
           <div class="info" id="fmtinfo"></div>
           <button class="btn btn-primary btn-block" id="gen" style="margin-top:18px">Generate study material →</button>
         </section>
@@ -246,7 +351,13 @@
       guide: "Study guides group your notes by section, pulling out key terms with their definitions and listing the remaining key points.",
       exam: "Practice exams pick up to 15 short-answer questions, spread across your sections. Write your answer, then reveal the model answer to check yourself.",
     };
-    const setInfo = () => ($("#fmtinfo").textContent = infos[format]);
+    const aiInfos = {
+      flashcards: "AI reads your selected notes and writes a card for each important term, fact, and process. AI can make mistakes, so check cards against your notes.",
+      guide: "AI organizes your notes into topics with key terms, definitions, and the main ideas to know. You can edit anything afterward.",
+      exam: "AI writes 10–15 short-answer questions that mix recall, explanation, and application, each with a model answer.",
+    };
+    const setInfo = () => ($("#fmtinfo").textContent = (mode === "ai" ? aiInfos : infos)[format]);
+    $("#mode").addEventListener("change", (e) => { mode = e.target.value; store.set("lastMode", mode); setInfo(); });
     setInfo();
     $$("[data-fmt]").forEach((l) => l.addEventListener("click", () => {
       format = l.dataset.fmt; store.set("lastFormat", format);
@@ -254,13 +365,28 @@
     }));
     bindNoteRows(app);
     $$("[data-select]").forEach((cb) => cb.addEventListener("change", () => ($("#selcount").textContent = `${selected.size} selected`)));
-    $("#gen").onclick = () => {
+    $("#gen").onclick = async () => {
       const src = notes.filter((n) => selected.has(n.id));
       if (!src.length) { toast("Select at least one note."); return; }
-      const items = NoteGen.generate(src, format);
-      if (!items.length) { toast("Couldn't find definitions or key points in those notes. Try notes with one idea per line."); return; }
       const title = $("#stitle").value.trim() || (src.length === 1 ? src[0].title : `${src[0].title} + ${src.length - 1} more`);
-      const set = { id: uid(), title, format, items, noteIds: src.map((n) => n.id), known: [], createdAt: Date.now(), updatedAt: Date.now() };
+      let items;
+      if (mode === "ai") {
+        const btn = $("#gen"), label = btn.innerHTML;
+        btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> AI is writing your study set…';
+        try {
+          const data = await aiPost("/generate", { format, title, notes: src.map((n) => ({ title: n.title, text: n.text })) });
+          items = (data.items || []).map((it) => ({ ...it, id: uid(), ...(format === "flashcards" ? { kind: "ai" } : {}) }));
+        } catch (err) {
+          btn.disabled = false; btn.innerHTML = label;
+          toast(err.message + " You can switch to rule-based mode.");
+          return;
+        }
+        if (!items.length) { btn.disabled = false; btn.innerHTML = label; toast("The AI didn't return anything. Try again."); return; }
+      } else {
+        items = NoteGen.generate(src, format);
+        if (!items.length) { toast("Couldn't find definitions or key points in those notes. Try notes with one idea per line."); return; }
+      }
+      const set = { id: uid(), title, format, mode, items, noteIds: src.map((n) => n.id), known: [], createdAt: Date.now(), updatedAt: Date.now() };
       sets.unshift(set); save();
       location.hash = "#/set/" + set.id;
     };
@@ -307,7 +433,7 @@
       <div class="file-icon">${f.icon}</div>
       <h3>${esc(s.title)}</h3>
       <span class="muted small">${f.label} · ${s.items.length} ${f.unit}</span>
-      <span><span class="badge gray">Rule-based</span></span>
+      <span>${s.mode === "ai" ? '<span class="badge">AI generated</span>' : '<span class="badge gray">Rule-based</span>'}</span>
       <span class="muted small">${s.known.length}/${s.items.length} ${verb} · Updated ${new Date(s.updatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</span>
       <div class="progress"><div style="width:${pct}%"></div></div>
       <div class="row between" style="margin-top:6px"><a href="#/set/${s.id}">Open set →</a><button class="btn-danger" data-del="${s.id}">Delete</button></div>
@@ -376,7 +502,7 @@
       pos = Math.max(0, Math.min(pos, order.length - 1));
       const c = cur();
       card.classList.remove("flipped");
-      $("#flabel").textContent = c.kind === "cloze" ? "Fill in the blank" : "Term";
+      $("#flabel").textContent = c.kind === "cloze" ? "Fill in the blank" : c.kind === "ai" ? "Prompt" : "Term";
       $("#ftext").textContent = c.front;
       $("#btext").textContent = c.back;
       $("#bsrc").textContent = "From: " + c.section;
