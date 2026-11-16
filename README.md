@@ -23,4 +23,3 @@ python3 -m http.server
 
 ## Deploy
 Hosted with GitHub Pages from the `main` branch root.
-
